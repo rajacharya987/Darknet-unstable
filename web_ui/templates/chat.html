@@ -6,68 +6,149 @@
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <title>AegisNet Chat</title>
     
-    <!-- Prevent FOUC -->
+    <!-- Load styles -->
+    <link href="/static/vendor/tailwind.min.css" rel="stylesheet">
+    <script src="/static/vendor/vue.global.prod.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    
+    <!-- Custom styles -->
     <style>
-        .vue-loading {
-            display: none;
+        [v-cloak] { display: none; }
+        
+        .message-enter-active,
+        .message-leave-active {
+            transition: all 0.3s ease;
         }
-        [v-cloak] {
-            display: none;
+        
+        .message-enter-from,
+        .message-leave-to {
+            opacity: 0;
+            transform: translateY(30px);
+        }
+        
+        .messages-container {
+            scrollbar-width: thin;
+            scrollbar-color: rgba(156, 163, 175, 0.5) transparent;
+        }
+        
+        .messages-container::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        .messages-container::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        
+        .messages-container::-webkit-scrollbar-thumb {
+            background-color: rgba(156, 163, 175, 0.5);
+            border-radius: 3px;
+        }
+        
+        .message-bubble {
+            max-width: 80%;
+            word-wrap: break-word;
+        }
+        
+        .message-bubble.own {
+            background-color: #1a73e8;
+            color: white;
+            margin-left: auto;
+        }
+        
+        .message-bubble.other {
+            background-color: #f3f4f6;
+            color: black;
+            margin-right: auto;
+        }
+        
+        .connection-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 4px;
+        }
+        
+        .connection-dot.connected {
+            background-color: #10b981;
+            box-shadow: 0 0 8px #10b981;
+        }
+        
+        .connection-dot.disconnected {
+            background-color: #ef4444;
+            box-shadow: 0 0 8px #ef4444;
         }
     </style>
-    
-    <!-- Load styles first -->
-    <link href="/static/vendor/tailwind.min.css" rel="stylesheet" type="text/css">
-    <script src="/static/vendor/vue.global.prod.js" type="application/javascript"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
 </head>
 <body class="bg-gray-100 h-screen">
     <input type="hidden" id="room-hash" value="{{ room_hash }}">
     <input type="hidden" id="username" value="{{ username }}">
     
-    <div id="app" class="container mx-auto px-4 h-full py-4">
+    <div id="app" class="container mx-auto px-4 h-full py-4" v-cloak>
         <div class="bg-white rounded-lg shadow-lg h-full flex flex-col">
             <!-- Header -->
-            <div class="p-4 border-b flex items-center justify-between">
+            <div class="p-4 border-b flex items-center justify-between bg-gray-50">
                 <div>
-                    <h1 class="text-xl font-bold">AegisNet Chat</h1>
-                    <p class="text-sm text-gray-600">Room: {{ room_hash }}</p>
+                    <h1 class="text-xl font-bold text-gray-800">AegisNet Chat</h1>
+                    <p class="text-sm text-gray-600">Room: [[ roomHash ]]</p>
                 </div>
                 <div class="flex items-center space-x-2">
-                    <span class="text-sm" :class="connected ? 'text-green-600' : 'text-red-600'">
-                        ● [[ connected ? 'Connected' : 'Disconnected' ]]
+                    <span class="connection-dot" :class="connected ? 'connected' : 'disconnected'"></span>
+                    <span class="text-sm font-medium" :class="connected ? 'text-green-600' : 'text-red-600'">
+                        [[ connected ? 'Connected' : 'Disconnected' ]]
                     </span>
                 </div>
             </div>
             
             <!-- Error message -->
-            <div v-if="error" class="p-4 bg-red-100 text-red-700">
-                [[ error ]]
-            </div>
+            <transition name="fade">
+                <div v-if="error" class="p-4 bg-red-50 border-l-4 border-red-500">
+                    <div class="flex">
+                        <div class="flex-shrink-0">
+                            <svg class="h-5 w-5 text-red-400" viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>
+                            </svg>
+                        </div>
+                        <div class="ml-3">
+                            <p class="text-sm text-red-700">[[ error ]]</p>
+                        </div>
+                    </div>
+                </div>
+            </transition>
             
             <!-- Messages -->
-            <div ref="messagesContainer" class="flex-1 overflow-y-auto p-4 space-y-4">
-                <div v-for="msg in messages" :key="msg.id" class="flex flex-col">
-                    <div class="flex items-baseline space-x-2">
-                        <span class="font-bold">[[ msg.username ]]:</span>
-                        <span>[[ msg.content ]]</span>
+            <div ref="messagesContainer" class="flex-1 overflow-y-auto p-4 space-y-4 messages-container">
+                <transition-group name="message">
+                    <div v-for="msg in messages" :key="msg.id" class="flex flex-col">
+                        <div class="message-bubble p-3 rounded-lg" :class="msg.username === username ? 'own' : 'other'">
+                            <div class="flex items-baseline justify-between mb-1">
+                                <span class="font-medium text-sm" :class="msg.username === username ? 'text-white' : 'text-gray-900'">
+                                    [[ msg.username ]]
+                                </span>
+                                <span class="text-xs opacity-75">
+                                    [[ formatTimestamp(msg.timestamp) ]]
+                                </span>
+                            </div>
+                            <p :class="msg.username === username ? 'text-white' : 'text-gray-800'">[[ msg.content ]]</p>
+                        </div>
                     </div>
-                    <span class="text-xs text-gray-500">[[ formatTimestamp(msg.timestamp) ]]</span>
-                </div>
+                </transition-group>
             </div>
             
             <!-- Input -->
-            <div class="p-4 border-t">
+            <div class="p-4 border-t bg-gray-50">
                 <form @submit.prevent="sendMessage" class="flex space-x-2">
                     <input 
                         v-model="newMessage" 
                         type="text" 
                         placeholder="Type your message..." 
-                        class="flex-1 px-4 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        class="flex-1 px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        :disabled="!connected"
                     >
                     <button 
                         type="submit" 
-                        class="px-6 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        class="px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        :disabled="!connected || !newMessage.trim()"
                     >
                         Send
                     </button>
@@ -76,6 +157,6 @@
         </div>
     </div>
     
-    <script src="/static/js/app.js" type="application/javascript" defer></script>
+    <script src="/static/js/app.js"></script>
 </body>
 </html> 

@@ -9,7 +9,7 @@ import time
 import base64
 import argparse
 import upnpy
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 from utils.crypto import CryptoEngine
 from utils.rotten_routing import RottenRouter
 
@@ -36,20 +36,24 @@ class AegisNode:
             'join': self.handle_join,
             'leave': self.handle_leave,
             'message': self.handle_message,
-            'relay': self.handle_relay
+            'relay': self.handle_relay,
+            'discover': self.handle_discover
         }
+        
+        # Discovery servers (now using onion addresses)
+        self.discovery_servers = [
+            ('aegisnet.onion', 40400),     # Tor hidden service
+            ('aegisnet-2.onion', 40400),   # Backup hidden service
+            ('127.0.0.1', 40400),          # Local development only
+        ]
+        
+        # Initialize Tor connection if available
+        self.setup_tor_connection()
         
         # UPnP setup
         self.upnp = None
         self.mapped_port = None
         self.setup_upnp()
-        
-        # Add discovery server info
-        self.discovery_servers = [
-            ('aegisnet-discovery.onrender.com', 40400),  # Cloud discovery server
-            ('192.168.254.17', 40400),  # Main discovery server
-            ('127.0.0.1', 40400),       # Local fallback
-        ]
 
     def setup_upnp(self):
         """Setup UPnP with multiple fallback attempts"""
@@ -112,111 +116,108 @@ class AegisNode:
             except Exception as e:
                 print(f"⚠️ Failed to remove port mapping: {e}")
 
-    def start(self):
-        """Start the peer node"""
-        self.running = True
-        self.receiver_thread = threading.Thread(target=self._receive_loop)
-        self.receiver_thread.daemon = True
-        self.receiver_thread.start()
+    def setup_tor_connection(self):
+        """Setup Tor connection for anonymous communication"""
+        try:
+            import stem.process
+            import stem.control
+            
+            # Start Tor process
+            self.tor_process = stem.process.launch_tor_with_config(
+                config = {
+                    'SocksPort': str(9050),
+                    'ControlPort': str(9051),
+                    'CookieAuthentication': '1'
+                },
+                init_msg_handler = lambda msg: print(f"Tor: {msg}")
+            )
+            
+            print("✅ Connected to Tor network")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to connect to Tor: {e}")
+            print("⚠️ Falling back to direct connection (less anonymous)")
+            self.tor_process = None
+            
+    def discover_room(self, room_code):
+        """Discover room through the network without exposing IP"""
+        print(f"🔍 Discovering room {room_code}...")
         
-        self.cleanup_thread = threading.Thread(target=self._cleanup_loop)
-        self.cleanup_thread.daemon = True
-        self.cleanup_thread.start()
+        # Create discovery message
+        discovery_msg = {
+            'type': 'discover',
+            'room_code': room_code,
+            'public_key': base64.b64encode(bytes(self.crypto.public_key)).decode(),
+            'username': self.username
+        }
         
-        actual_port = self.sock.getsockname()[1]
-        print(f"🔥 Node started on port {actual_port}")
-        print(f"👤 Username: {self.username}")
-        print(f"🔑 Public Key: {base64.b64encode(bytes(self.crypto.public_key)).decode()}")
-
-    def stop(self):
-        """Stop the peer node"""
-        self.running = False
+        # Try discovery servers through Tor if available
+        for server in self.discovery_servers:
+            try:
+                # Generate anonymous circuit
+                circuit = self.router.generate_circuit(destination=server)
+                
+                # Wrap message in layers
+                wrapped = self.router.wrap_message(
+                    json.dumps(discovery_msg).encode(),
+                    self.crypto.public_key,
+                    circuit
+                )
+                
+                # Send through first hop
+                first_hop = circuit[0]
+                self.sock.sendto(json.dumps(wrapped).encode(), first_hop)
+                
+                # Wait for response
+                try:
+                    data, _ = self.sock.recvfrom(65536)
+                    response = json.loads(data.decode())
+                    
+                    if response.get('success'):
+                        # Join room through the circuit
+                        self.join_room(room_code, circuit=circuit)
+                        return
+                        
+                except socket.timeout:
+                    continue
+                    
+            except Exception as e:
+                print(f"Discovery server {server} failed: {e}")
+                continue
+                
+        raise Exception("Room discovery failed: No discovery servers available")
+        
+    def join_room(self, room_code: str, circuit: List[Tuple[str, int]] = None):
+        """Join room through an anonymous circuit"""
         if self.current_room:
             self.leave_room()
-        self.cleanup_upnp()
-        self.sock.close()
-
-    def _receive_loop(self):
-        """Main receive loop for incoming messages"""
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(65536)  # Max UDP packet size
-                threading.Thread(target=self._handle_packet, args=(data, addr)).start()
-            except Exception as e:
-                if self.running:  # Only log if we're still supposed to be running
-                    print(f"❌ Error in receive loop: {e}")
-
-    def _cleanup_loop(self):
-        """Periodic cleanup of expired messages and routes"""
-        while self.running:
-            try:
-                self.router.cleanup_expired_routes()
-                time.sleep(5)  # Cleanup every 5 seconds
-            except Exception as e:
-                if self.running:
-                    print(f"❌ Error in cleanup loop: {e}")
-
-    def _handle_packet(self, data: bytes, addr: tuple):
-        """Handle incoming packet"""
-        try:
-            message = json.loads(data.decode())
-            
-            if message['type'] == 'rotten':
-                # Handle Rotten Routed message
-                message_data, next_hop = self.router.unwrap_layer(message)
-                
-                if next_hop:
-                    # Forward to next hop
-                    self.forward_message(message_data, next_hop)
-                else:
-                    # We're the final recipient
-                    handler = self.message_handlers.get(message_data['type'])
-                    if handler:
-                        handler(message_data['payload'], addr)
-            else:
-                # Direct message
-                handler = self.message_handlers.get(message['type'])
-                if handler:
-                    handler(message['payload'], addr)
-                    
-        except Exception as e:
-            print(f"❌ Error handling packet: {e}")
-
-    def create_room(self) -> str:
-        """Create a new room and return the room code"""
-        if self.current_room:
-            raise ValueError("Already in a room")
-            
-        # Generate random room code
-        room_code = base64.b64encode(os.urandom(8)).decode()
-        self.current_room = self.crypto.generate_room_url(room_code)
-        self.room_peers = {}
-        
-        print(f"📢 Created room: {self.current_room}")
-        print(f"🔑 Room code: {room_code}")
-        return room_code
-
-    def join_room(self, room_code: str, bootstrap_peer: Optional[tuple] = None):
-        """Join an existing room"""
-        if self.current_room:
-            raise ValueError("Already in a room")
             
         # Generate room URL from code
         room_url = self.crypto.generate_room_url(room_code)
         self.current_room = room_url
         
-        if bootstrap_peer:
-            # Send join request to bootstrap peer
-            join_message = {
-                'type': 'join',
-                'payload': {
-                    'room_url': room_url,
-                    'username': self.username,
-                    'public_key': base64.b64encode(bytes(self.crypto.public_key)).decode()
-                }
-            }
-            self.sock.sendto(json.dumps(join_message).encode(), bootstrap_peer)
+        if not circuit:
+            # Create new circuit if none provided
+            circuit = self.router.generate_circuit()
             
+        # Send join message through circuit
+        join_msg = {
+            'type': 'join',
+            'room_url': room_url,
+            'username': self.username,
+            'public_key': base64.b64encode(bytes(self.crypto.public_key)).decode()
+        }
+        
+        wrapped = self.router.wrap_message(
+            json.dumps(join_msg).encode(),
+            self.crypto.public_key,
+            circuit
+        )
+        
+        # Send through first hop
+        first_hop = circuit[0]
+        self.sock.sendto(json.dumps(wrapped).encode(), first_hop)
+        
         print(f"🔗 Joined room: {room_url}")
 
     def leave_room(self):
@@ -240,7 +241,7 @@ class AegisNode:
         print("👋 Left room")
 
     def send_message(self, message: str):
-        """Send a message to all peers in the room"""
+        """Send message through anonymous circuit"""
         if not self.current_room or not self.room_peers:
             raise ValueError("Not in a room or no peers available")
             
@@ -249,21 +250,21 @@ class AegisNode:
             'username': self.username,
             'timestamp': time.time()
         }
-            
+        
         for peer_id, (ip, port, public_key, username) in self.room_peers.items():
             try:
-                # Select route for this peer
-                route = self.router.select_route([peer_id])
+                # Generate new circuit for each peer
+                circuit = self.router.generate_circuit(destination=(ip, port))
                 
                 # Encrypt message for recipient
                 encrypted = self.crypto.encrypt_message(json.dumps(message_data), public_key)
                 
-                # Wrap in Rotten Routing layers
-                wrapped = self.router.wrap_message(encrypted, public_key, route)
+                # Wrap in routing layers
+                wrapped = self.router.wrap_message(encrypted, public_key, circuit)
                 
-                # Send to first hop
-                first_hop = route[0]
-                self.sock.sendto(json.dumps(wrapped).encode(), (first_hop[0], first_hop[1]))
+                # Send through first hop
+                first_hop = circuit[0]
+                self.sock.sendto(json.dumps(wrapped).encode(), first_hop)
                 
             except Exception as e:
                 print(f"❌ Error sending to peer {username}: {e}")
@@ -349,49 +350,11 @@ class AegisNode:
         except:
             return "Unable to determine"
 
-    def discover_room(self, room_code):
-        """Discover and join a room using just the room code"""
-        print(f"🔍 Discovering room {room_code}...")
-        
-        last_error = None
-        for server in self.discovery_servers:
-            try:
-                # Try to query the discovery server
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)  # 5 second timeout
-                sock.connect(server)
-                
-                # Send discovery request
-                request = {
-                    'type': 'discover',
-                    'room_code': room_code
-                }
-                sock.send(json.dumps(request).encode('utf-8'))
-                
-                # Get response
-                response = sock.recv(1024).decode('utf-8')
-                data = json.loads(response)
-                
-                if data.get('success'):
-                    # Got room info, try to join
-                    host = data['host']
-                    port = data['port']
-                    print(f"📡 Found room at {host}:{port}")
-                    self.join_room(room_code, (host, port))
-                    return
-                    
-            except Exception as e:
-                print(f"Discovery server {server} failed: {e}")
-                last_error = e
-                continue
-            finally:
-                sock.close()
-                
-        # If we get here, all discovery attempts failed
-        if last_error:
-            raise Exception(f"Room discovery failed: {last_error}")
-        else:
-            raise Exception("Room discovery failed: No discovery servers available")
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.tor_process:
+            self.tor_process.kill()
+        self.stop()
 
 def main():
     parser = argparse.ArgumentParser(description='AegisNet Ghost Mode')
@@ -449,7 +412,7 @@ def main():
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
     finally:
-        node.stop()
+        node.cleanup()
 
 if __name__ == '__main__':
     main() 

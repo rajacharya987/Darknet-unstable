@@ -1,3 +1,4 @@
+import os
 import random
 from typing import List, Dict, Tuple, Optional
 from nacl.public import Box, PublicKey
@@ -5,125 +6,120 @@ from nacl.utils import random as nacl_random
 import base64
 import json
 import time
+import hashlib
 
 class RottenRouter:
     def __init__(self, crypto_engine):
-        self.crypto_engine = crypto_engine
-        self.known_peers = {}  # {peer_id: (ip, port, public_key)}
-        self.relay_cache = {}  # {message_id: (next_hop, expiry)}
-        self.DEFAULT_TTL = 3
-        self.MAX_TTL = 5
-        self.RELAY_TIMEOUT = 60  # seconds
-
-    def wrap_message(self, message: dict, recipient_key: bytes, route: List[Tuple[str, int, bytes]]) -> dict:
-        """
-        Wrap a message in multiple encryption layers for Rotten Routing
+        self.crypto = crypto_engine
+        self.routes: Dict[str, List[Tuple[str, int]]] = {}
+        self.route_ttl = 3600  # 1 hour route lifetime
+        self.min_hops = 3      # Minimum number of hops for anonymity
+        self.max_hops = 5      # Maximum number of hops
+        self.known_relays = set()  # Set of known relay nodes
         
-        Args:
-            message: The original message dict
-            recipient_key: Public key of final recipient
-            route: List of relay nodes [(ip, port, public_key), ...]
+    def add_relay(self, address: Tuple[str, int]):
+        """Add a known relay node"""
+        self.known_relays.add(address)
         
-        Returns:
-            dict: Wrapped message with routing information
-        """
-        current_payload = {
+    def generate_circuit(self, destination: Optional[Tuple[str, int]] = None) -> List[Tuple[str, int]]:
+        """Generate an anonymous circuit with multiple hops"""
+        if not self.known_relays:
+            raise ValueError("No relay nodes available")
+            
+        # Determine number of hops (random between min and max)
+        num_hops = random.randint(self.min_hops, self.max_hops)
+        
+        # Select random relays for the circuit
+        available_relays = list(self.known_relays)
+        if destination:
+            available_relays.append(destination)
+            
+        if len(available_relays) < num_hops:
+            # If not enough relays, duplicate some
+            while len(available_relays) < num_hops:
+                available_relays.append(random.choice(list(self.known_relays)))
+                
+        # Shuffle and select hops
+        random.shuffle(available_relays)
+        circuit = available_relays[:num_hops]
+        
+        if destination and destination not in circuit:
+            # Ensure destination is last hop
+            circuit[-1] = destination
+            
+        return circuit
+        
+    def wrap_message(self, message: bytes, recipient_key: bytes, route: List[Tuple[str, int]]) -> dict:
+        """Wrap message in multiple encryption layers (onion routing)"""
+        # Start with the innermost layer (message + recipient key)
+        current_layer = {
             'type': 'message',
-            'payload': message,
-            'timestamp': int(time.time()),
-            'final': True
+            'payload': base64.b64encode(message).decode(),
+            'recipient_key': base64.b64encode(recipient_key).decode()
         }
         
-        # Encrypt for final recipient
-        box = Box(self.crypto_engine.private_key, PublicKey(recipient_key))
-        current_payload = box.encrypt(
-            json.dumps(current_payload).encode(),
-            nacl_random(Box.NONCE_SIZE)
-        )
-        current_payload = base64.b64encode(current_payload).decode()
-
-        # Add routing layers
-        for relay_ip, relay_port, relay_key in reversed(route):
-            next_hop = {
+        # Add layers of encryption for each hop in reverse
+        for hop in reversed(route[1:]):  # Skip first hop
+            # Generate temporary key for this hop
+            hop_key = os.urandom(32)
+            
+            # Encrypt current layer
+            encrypted_data = self.crypto.encrypt_with_key(
+                json.dumps(current_layer).encode(),
+                hop_key
+            )
+            
+            # Create new layer
+            current_layer = {
                 'type': 'relay',
-                'payload': current_payload,
-                'next_ip': relay_ip,
-                'next_port': relay_port,
-                'timestamp': int(time.time()),
-                'ttl': self.DEFAULT_TTL
+                'next_hop': {'ip': hop[0], 'port': hop[1]},
+                'hop_key': base64.b64encode(hop_key).decode(),
+                'payload': base64.b64encode(encrypted_data).decode()
             }
             
-            # Encrypt for relay
-            box = Box(self.crypto_engine.private_key, PublicKey(relay_key))
-            current_payload = box.encrypt(
-                json.dumps(next_hop).encode(),
-                nacl_random(Box.NONCE_SIZE)
-            )
-            current_payload = base64.b64encode(current_payload).decode()
-
         return {
             'type': 'rotten',
-            'payload': current_payload,
-            'timestamp': int(time.time())
+            'route_id': self._generate_route_id(route),
+            'ttl': len(route),
+            'payload': current_layer
         }
-
-    def unwrap_layer(self, wrapped_message: dict) -> Tuple[dict, Optional[Tuple[str, int]]]:
-        """
-        Decrypt one layer of a Rotten Routed message
         
-        Returns:
-            (message_data, next_hop) where next_hop is None if this is the final recipient
-        """
-        try:
-            # Decrypt the current layer
-            encrypted = base64.b64decode(wrapped_message['payload'])
-            box = Box(self.crypto_engine.private_key, PublicKey(wrapped_message['sender']))
-            decrypted = box.decrypt(encrypted)
-            message_data = json.loads(decrypted.decode())
-
-            # Check TTL and timestamp
-            current_time = int(time.time())
-            if current_time - message_data['timestamp'] > self.RELAY_TIMEOUT:
-                raise ValueError("Message expired")
+    def unwrap_layer(self, message: dict) -> Tuple[dict, Optional[Tuple[str, int]]]:
+        """Unwrap one layer of encryption"""
+        if message['type'] != 'rotten':
+            return message, None
             
-            if message_data['type'] == 'relay':
-                if message_data['ttl'] <= 0:
-                    raise ValueError("TTL expired")
-                return message_data, (message_data['next_ip'], message_data['next_port'])
+        payload = message['payload']
+        if payload['type'] == 'relay':
+            # Decrypt layer with hop key
+            hop_key = base64.b64decode(payload['hop_key'])
+            encrypted_data = base64.b64decode(payload['payload'])
             
-            elif message_data['type'] == 'message':
-                return message_data, None
-                
-        except Exception as e:
-            raise ValueError(f"Failed to unwrap message: {str(e)}")
-
-    def select_route(self, exclude_peers: List[str] = None) -> List[Tuple[str, int, bytes]]:
-        """
-        Select 2-3 random peers for routing
+            try:
+                decrypted_data = self.crypto.decrypt_with_key(encrypted_data, hop_key)
+                inner_layer = json.loads(decrypted_data.decode())
+                next_hop = (payload['next_hop']['ip'], payload['next_hop']['port'])
+                return inner_layer, next_hop
+            except Exception as e:
+                print(f"Failed to decrypt layer: {e}")
+                return None, None
+        else:
+            # Final layer with actual message
+            return payload, None
+            
+    def _generate_route_id(self, route: List[Tuple[str, int]]) -> str:
+        """Generate unique ID for a route"""
+        route_str = ','.join(f"{ip}:{port}" for ip, port in route)
+        return hashlib.sha256(route_str.encode()).hexdigest()[:16]
         
-        Args:
-            exclude_peers: List of peer IDs to exclude from routing
-            
-        Returns:
-            List of (ip, port, public_key) tuples for routing
-        """
-        available_peers = [
-            (ip, port, key) for pid, (ip, port, key) in self.known_peers.items()
-            if not exclude_peers or pid not in exclude_peers
-        ]
-        
-        if len(available_peers) < 2:
-            raise ValueError("Not enough peers available for routing")
-            
-        num_hops = random.randint(2, min(3, len(available_peers)))
-        return random.sample(available_peers, num_hops)
-
     def cleanup_expired_routes(self):
-        """Remove expired routes from relay cache"""
-        current_time = int(time.time())
-        expired = [
-            mid for mid, (_, expiry) in self.relay_cache.items()
-            if current_time > expiry
-        ]
-        for mid in expired:
-            del self.relay_cache[mid] 
+        """Remove expired routes"""
+        current_time = time.time()
+        expired = []
+        
+        for route_id, (timestamp, _) in self.routes.items():
+            if current_time - timestamp > self.route_ttl:
+                expired.append(route_id)
+                
+        for route_id in expired:
+            del self.routes[route_id] 
