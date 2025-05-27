@@ -8,117 +8,78 @@ document.addEventListener('DOMContentLoaded', () => {
             return {
                 messages: [],
                 newMessage: '',
-                username: '',
-                roomHash: '',
-                connected: false,
-                socket: null,
-                error: null
+                username: INITIAL_DATA.username,
+                roomHash: INITIAL_DATA.roomHash,
+                publicIp: INITIAL_DATA.publicIp,
+                port: INITIAL_DATA.port,
+                messageCheckInterval: null,
+                lastMessageId: -1,
+                baseUrl: `http://${INITIAL_DATA.roomHash}.aegisnet`
             };
         },
         methods: {
-            setupWebSocket() {
-                // Connect to WebSocket server
-                this.socket = io();
-                
-                // Handle connection events
-                this.socket.on('connect', () => {
-                    this.connected = true;
-                    console.log('Connected to WebSocket server');
-                });
-                
-                this.socket.on('disconnect', () => {
-                    this.connected = false;
-                    console.log('Disconnected from WebSocket server');
-                });
-                
-                // Handle incoming messages
-                this.socket.on('new_message', (message) => {
-                    this.messages.push(message);
-                    this.$nextTick(() => {
-                        this.scrollToBottom();
-                    });
-                });
-                
-                // Handle errors
-                this.socket.on('error', (data) => {
-                    this.error = data.message;
-                    setTimeout(() => {
-                        this.error = null;
-                    }, 5000);
-                });
-            },
-            
-            async loadMessages() {
-                try {
-                    const response = await fetch('/api/messages');
-                    const data = await response.json();
-                    if (data.success) {
-                        this.messages = data.messages;
-                        this.$nextTick(() => {
-                            this.scrollToBottom();
-                        });
-                    }
-                } catch (error) {
-                    console.error('Failed to load messages:', error);
-                }
-            },
-            
             async sendMessage() {
                 if (!this.newMessage.trim()) return;
                 
-                if (this.connected) {
-                    // Send via WebSocket
-                    this.socket.emit('send_message', {
-                        message: this.newMessage
+                try {
+                    const response = await fetch(`${this.baseUrl}/api/send_message`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            message: this.newMessage
+                        })
                     });
-                    this.newMessage = '';
-                } else {
-                    // Fallback to HTTP if WebSocket is not connected
-                    try {
-                        const response = await fetch('/api/send_message', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                message: this.newMessage
-                            })
-                        });
-                        
+                    
+                    if (response.ok) {
+                        // Clear input but don't add message (it will come through polling)
+                        this.newMessage = '';
+                    } else {
                         const data = await response.json();
-                        if (data.success) {
-                            this.newMessage = '';
-                        } else {
-                            this.error = data.error;
-                            setTimeout(() => {
-                                this.error = null;
-                            }, 5000);
-                        }
-                    } catch (error) {
-                        console.error('Failed to send message:', error);
+                        console.error('Failed to send message:', data.error);
                     }
+                } catch (error) {
+                    console.error('Failed to send message:', error);
                 }
             },
-            
-            scrollToBottom() {
-                const container = this.$refs.messagesContainer;
-                container.scrollTop = container.scrollHeight;
-            },
-            
-            formatTimestamp(timestamp) {
-                return new Date(timestamp * 1000).toLocaleTimeString();
+            async checkNewMessages() {
+                try {
+                    const response = await fetch(`${this.baseUrl}/api/messages`);
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data.success && data.messages) {
+                            // Add only new messages
+                            const newMessages = data.messages.filter(msg => msg.id > this.lastMessageId);
+                            if (newMessages.length > 0) {
+                                this.messages.push(...newMessages);
+                                this.lastMessageId = Math.max(...data.messages.map(m => m.id));
+                                
+                                // Scroll to bottom
+                                this.$nextTick(() => {
+                                    const chatDiv = document.getElementById('chat-messages');
+                                    chatDiv.scrollTop = chatDiv.scrollHeight;
+                                });
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('Failed to check messages:', error);
+                }
             }
         },
         mounted() {
-            // Get room info from page
-            this.roomHash = document.getElementById('room-hash').value;
-            this.username = document.getElementById('username').value;
+            // Start checking for new messages
+            this.messageCheckInterval = setInterval(this.checkNewMessages, 1000);
             
-            // Setup WebSocket
-            this.setupWebSocket();
-            
-            // Initial message load
-            this.loadMessages();
+            // Initial message check
+            this.checkNewMessages();
+        },
+        beforeUnmount() {
+            // Clean up interval
+            if (this.messageCheckInterval) {
+                clearInterval(this.messageCheckInterval);
+            }
         }
     }).mount('#app');
 }); 
